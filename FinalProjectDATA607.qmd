@@ -1,0 +1,254 @@
+---
+title: "DATA607-FinalProject"
+format: html
+editor: visual
+---
+
+```{r}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(tidycensus)
+library(leaflet)
+library(sf)
+library(tigris)
+library(knitr)
+```
+
+## Load ARDA Data 
+
+```{r}
+url_2000 <- "https://github.com/AslamF/DATA607-FinalProject/raw/main/US%20Religion%20Census%202000.XLSX"
+url_2010 <- "https://github.com/AslamF/DATA607-FinalProject/raw/main/US%20Religion%20Census%202010%20Membership%20Study.XLSX"
+url_2020 <- "https://github.com/AslamF/DATA607-FinalProject/raw/main/US%20Religion%20Census%202020.xlsx"
+
+read_github_xlsx <- function(url) {
+  tmp <- tempfile(fileext = ".xlsx")
+  download.file(url, tmp, mode = "wb", quiet = TRUE)
+  read_excel(tmp)
+}
+
+arda_2000_raw <- read_github_xlsx(url_2000)
+arda_2010_raw <- read_github_xlsx(url_2010)
+arda_2020_raw <- read_github_xlsx(url_2020)
+
+```
+
+## Clean and Extract Muslim Data 
+
+```{r}
+# Standarize Data from all 3 years into same structure 
+
+arda_2000 <- arda_2000_raw %>%
+  select(state = STATENAM,
+         mosques = ISLAMCG,
+         adherents = ISLAMAD) %>%
+  mutate(year = 2000,
+         mosques = as.numeric(mosques),
+         adherents = as.numeric(adherents),
+         state = as.character(state))
+
+
+arda_2010 <- arda_2010_raw %>%
+  select(state = STNAME,
+         mosques = MSLMCNG,
+         adherents = MSLMADH) %>%
+  mutate(year = 2010,
+         mosques = as.numeric(mosques),
+         adherents = as.numeric(adherents),
+         state = as.character(state))
+
+arda_2020 <- arda_2020_raw %>%
+  select(state = STATNAM,
+         mosques = MSLMCNG_2020,
+         adherents = MSLMADH_2020) %>%
+  mutate(year = 2020,
+         mosques = as.numeric(mosques),
+         adherents = as.numeric(adherents),
+         state = as.character(state))
+
+# Stack into long format
+# Filter out rows with no mosque data 
+arda_long <- bind_rows(arda_2000, arda_2010, arda_2020) %>%
+  filter(!is.na(mosques), mosques > 0)
+
+head(arda_long)
+```
+
+## Calculate Growth Rates 
+
+```{r}
+
+# Switch from long to wide format. Each row has a column for each year 
+# Calculate growth percentage 2000 --> 2020
+arda_wide <- arda_long %>%
+  select(state, year, mosques) %>%
+  pivot_wider(names_from = year, values_from = mosques,
+              names_prefix = "mosques_") %>%
+  mutate(growth_pct = ((mosques_2020 - mosques_2000) / mosques_2000) * 100) %>%
+  filter(!is.na(growth_pct))
+
+head(arda_wide)
+```
+
+## Load ACS Data 
+
+```{r}
+census_api_key("e6afdcc55c31fd2b74a4d3217d20058cf09c5f53", install = FALSE)
+
+# Immigrant data broken down by country of birth at the state level 
+acs_raw <- get_acs(
+  geography = "state",
+  table = "B05006",
+  year = 2020,
+  survey = "acs5"
+)
+
+# muslim-origin immigrant population per state 
+muslim_vars <- c(
+  "B05006_047",  # Pakistan
+  "B05006_054",  # Bangladesh
+  "B05006_031",  # Egypt
+  "B05006_045",  # Iran
+  "B05006_062",  # Somalia
+  "B05006_051",  # Iraq
+  "B05006_052",  # Jordan
+  "B05006_057",  # Syria
+  "B05006_035",  # Morocco
+  "B05006_060"   # Yemen
+)
+
+# Filter to Muslim-majority country variables 
+acs_muslim <- acs_raw %>%
+  filter(variable %in% muslim_vars) %>%
+  group_by(NAME) %>%
+  summarise(muslim_immigrants = sum(estimate, na.rm = TRUE)) %>%
+  rename(state = NAME)
+
+head(acs_muslim)
+```
+
+## Join Data-sets
+
+```{r}
+
+# Join mosque growth and immigration data by state name 
+# This is our combined data-set 
+combined <- arda_wide %>%
+  left_join(acs_muslim, by = "state") %>%
+  filter(!is.na(muslim_immigrants))
+
+kable(head(combined, 10))
+```
+
+## Bar Chart - Top 15 States by mosque 
+
+```{r}
+
+# Visualize which states have the most mosques in 2020
+# slice_max selects the top 15 rows by mosque count 
+
+combined %>%
+  slice_max(mosques_2020, n = 15) %>%
+  ggplot(aes(x = reorder(state, mosques_2020), y = mosques_2020, fill = mosques_2020)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "#a8d5a2", high = "#2d6a4f") +
+  labs(title = "Top 15 States by Number of Mosques (2020)",
+       x = "State", y = "Number of Mosques") +
+  theme_minimal()
+```
+
+## Bar Chart - Top 15 States by Growth Rate 
+
+```{r}
+
+# Which states expereinced the fastest mosque growth from 2000-2020
+# Visual Implementation 
+combined %>%
+  slice_max(growth_pct, n = 15) %>%
+  ggplot(aes(x = reorder(state, growth_pct), y = growth_pct, fill = growth_pct)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "#a8d5a2", high = "#1b4332") +
+  labs(title = "Top 15 States by Mosque Growth Rate (2000–2020)",
+       x = "State", y = "Growth (%)") +
+  theme_minimal()
+```
+
+## Correlation 
+
+```{r}
+# Testing whether states with more muslim immigrants also saw fast mosque growth 
+
+cor.test(combined$muslim_immigrants, combined$growth_pct, method = "pearson")
+```
+
+## Linear Regression 
+
+```{r}
+
+# Simple Linear-Regression: mosque growth rate predicated by Muslim-orign imigrant
+# Dependent Variable --> Growth Percentage
+# Independent Variable --> Muslim_Immigrants 
+
+model <- lm(growth_pct ~ muslim_immigrants, data = combined)
+summary(model)
+```
+
+## Regression Plot 
+
+```{r}
+
+# Scatter plot of each state as a point
+# Shows the direction and strength of the relationship
+
+
+ggplot(combined, aes(x = muslim_immigrants, y = growth_pct)) +
+  geom_point(color = "#2d6a4f", size = 3, alpha = 0.7) +
+  geom_smooth(method = "lm", color = "#1b4332", se = TRUE) +
+  labs(title = "Muslim-Origin Immigrants vs. Mosque Growth Rate",
+       x = "Muslim-Origin Immigrant Population",
+       y = "Mosque Growth Rate 2000–2020 (%)") +
+  theme_minimal()
+```
+
+## Leaflet Map
+
+```{r}
+
+# Implementing a new visualization tool using Leaflet, using shapefiles from tigris
+# Joining combined data-set to the spatial data by state 
+options(tigris_use_cache = TRUE)
+states_geo <- states(cb = TRUE, resolution = "20m") %>%
+  filter(!STUSPS %in% c("PR", "GU", "VI", "MP", "AS")) %>%
+  left_join(combined, by = c("NAME" = "state"))
+
+
+# Color Green palatte to indiciate mosque growth percentage 
+pal <- colorNumeric(palette = "Greens", 
+                    domain = states_geo$growth_pct, 
+                    na.color = "#cccccc")
+
+# Interactive Leaflet Map
+# 
+leaflet(states_geo) %>%
+  setView(lng=-96, lat=37.8, zoom=4) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal(growth_pct),
+    fillOpacity = 0.8,
+    color = "white",
+    weight = 1,
+    label = ~paste0(NAME, ": ", round(growth_pct, 1), "% growth"),
+    highlightOptions = highlightOptions(weight = 2, color = "#333", 
+                                        bringToFront = TRUE)
+  ) %>%
+  addLegend(pal = pal, values = ~growth_pct,
+            title = "Mosque Growth<br>2000–2020 (%)",
+            position = "bottomright",
+            labFormat = labelFormat(suffix = "%", digits=0))
+```
